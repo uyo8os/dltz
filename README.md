@@ -1,6 +1,6 @@
 # SSH 登录 Telegram 通知
 
-在 Linux 服务器上发送 SSH 登录成功通知、监控连续认证失败，并查看近 24 小时失败 IP 前 10。入口仍是单文件 **`ssh-tg-notify.sh`**，无需另行下载监控程序。
+在 Linux 服务器上发送 SSH 登录成功通知、监控连续认证失败、查看近 24 小时失败 IP 前 10，以及更改 SSH 端口。入口仍是单文件 **`ssh-tg-notify.sh`**，无需另行下载辅助程序。
 
 ## 运行
 
@@ -36,6 +36,7 @@ SSH 登录 Telegram 通知
 6. 发送爆破测试通知
 7. 查看失败排名
 8. 卸载全部
+9. 更改 SSH 端口
 0. 退出
 ```
 
@@ -48,6 +49,7 @@ SSH 登录 Telegram 通知
 - **发送爆破测试通知**：发送包含模拟 IP 和 11 次失败的测试消息，标题标明“测试”，不影响实际计数。需要先添加 SSH 登录通知；不要求爆破监控已经开启。
 - **查看失败排名**：按最近 24 小时已有日志统计，显示失败次数最多的 10 个 IP，每行 `800次 66.66.66.61`。不需要先安装通知，也不需要开启监控。
 - **卸载全部**：先关闭爆破服务，再删除本脚本的服务文件、计数状态、PAM 标记块、通知程序、配置及安装前备份。保留其他 PAM 配置，包括安装后新增的条目；重复卸载无副作用。配置写错时卸载后重新添加即可。
+- **更改 SSH 端口**：独立功能，不要求先配置 Telegram。输入一个或多个端口后，先备份并同时启用旧、新端口；验证新端口成功登录后，输入 `yes` 才会移除旧端口。不确认则保留双端口。
 
 已有上一版英文脚本安装的 SSH 登录通知时，可以直接运行新版并选择 **4**，继续使用已有配置。
 
@@ -62,6 +64,7 @@ bash ssh-tg-notify.sh disable-bruteforce
 bash ssh-tg-notify.sh test-bruteforce
 bash ssh-tg-notify.sh rank
 bash ssh-tg-notify.sh uninstall
+bash ssh-tg-notify.sh change-port
 ```
 
 ## 安装前准备
@@ -69,6 +72,8 @@ bash ssh-tg-notify.sh uninstall
 适用于使用 Linux-PAM 的 OpenSSH Server，采用系统默认的 `/etc/ssh/sshd_config` 和 `/etc/pam.d/sshd`。不适用于 Dropbear、未集成 PAM 的 SSH 服务、Windows 或 macOS。登录成功通知依赖 Bash、curl、GNU coreutils、awk、grep、util-linux 的 flock，以及 `pam_exec.so`。
 
 **爆破通知额外需要 Python 3.8+（含标准库 sqlite3）以及运行中的 systemd/journald。失败排名需要 Python 3.8+，可读取 journald 或传统日志。** `ss`（iproute2）用于查询实际监听端口，没有时会尝试 SSH socket 单元及 SSH 有效配置。无需安装 Python 第三方包。
+
+**更改端口需要 Python 3.8+、systemd、OpenSSH 和 `ss`。** 支持常规 `ssh.service` / `sshd.service`，以及满足下文条件的 SSH socket 激活模式。
 
 常见系统安装依赖的示例（按实际发行版选择）：
 
@@ -157,6 +162,30 @@ Telegram 侧需要：
 
 如果日志保留不足 24 小时，只能统计现存记录；例如非持久 journal 在重启后可能不包含重启前的记录。没有记录时显示提示，不能据此保证没有发生过失败尝试。
 
+## 更改 SSH 端口
+
+选择 **9**，或运行：
+
+```bash
+bash ssh-tg-notify.sh change-port
+```
+
+1. 显示当前 SSH 端口。输入新端口，例如 `2222`；需要保留多个端口时输入 `22 2324 23555`。支持空格或英文逗号分隔，去重后排序；最多 16 个端口，范围 `1–65535`，留空取消。
+2. 检查当前 SSH 配置、服务部署方式和目标端口占用。目标端口被其他监听进程占用时拒绝修改。
+3. 备份主配置及涉及的全局 Include 文件，在 `/etc/ssh` 范围内更新全局 `Port`，处理显式 `ListenAddress` 端口并保留绑定地址。先同时保留旧、新端口，通过 `sshd -t` 校验和 `sshd -T` 有效端口检查后，再应用服务配置并验证实际监听。
+4. 保持当前连接，在服务器防火墙和云厂商安全组放行新 TCP 端口，另开连接测试，例如 `ssh -p 2222 root@服务器IP`。工具只检查本机监听，不会自动修改防火墙、云安全组、NAT 或 SELinux 策略，实际外网连通性需要这一步验证。
+5. 只有输入 `yes` 才移除旧端口，再次校验并应用配置。其他输入、输入结束或验证阶段按 Ctrl+C 都保留旧、新端口，方便继续排查。若输入的端口列表已经包含所有旧端口，则直接完成，无需移除确认。
+
+普通 OpenSSH 服务采用 **reload**，不重启服务。socket 激活模式会写入本脚本专属的 `zz-ssh-tg-notify-ports.conf`，重置 `ListenStream` 并保留原绑定地址，再重新加载 systemd 并重启 socket 及其 SSH 主进程；仅在 `Accept=no` 且对应服务为 `KillMode=process` 时执行，以保留当前 SSH 会话。其他 socket 模式会说明原因并取消。端口修改可能短暂影响新连接建立，已有会话仍应保持打开。
+
+校验失败、服务应用失败或新端口未监听时，自动恢复**该阶段开始前**的文件并重新应用原服务配置。因此，第二阶段失败会恢复到已验证的双端口状态。若回滚本身失败，会明确提示并输出备份目录。
+
+备份存放在 `/var/backups/ssh-tg-notify-ports/时间-随机值/`，每个阶段保存文件副本和 `manifest.json` 路径映射：阶段 `1` 为操作前配置，阶段 `2` 为移除旧端口前的双端口配置。备份保留供 root 排查恢复；需要恢复时按映射还原文件，再执行 `sshd -t` 并按实际服务模式重新加载。
+
+端口修改只支持单一 systemd OpenSSH 部署和默认配置入口 `/etc/ssh/sshd_config`。符号链接、外部或重复 Include、损坏的管理标记、多个 SSH 服务、使用 `-f/-p/-o` 覆盖配置的启动方式等复杂情况会拒绝自动修改。修改前实际监听与配置不符时也会取消，避免改错实例。相关行为参见 [OpenSSH Port/ListenAddress 文档](https://github.com/openssh/openssh-portable/blob/master/sshd_config.5)、[systemd.socket](https://www.freedesktop.org/software/systemd/man/latest/systemd.socket.html) 和 [KillMode](https://www.freedesktop.org/software/systemd/man/latest/systemd.kill.html)。
+
+“卸载全部”卸载通知功能，**不会恢复 SSH 端口或删除端口备份、socket 端口覆盖文件**；避免在卸载通知时改变正在使用的 SSH 连接入口。
+
 ## 文件与 PAM 管理
 
 | 路径 | 用途 |
@@ -199,6 +228,7 @@ session optional pam_exec.so quiet type=open_session /etc/ssh-tg-notify/notify.s
 bash -n ssh-tg-notify.sh
 bash tests/test-ssh-tg-notify.sh
 python3 tests/test_guard.py
+python3 tests/test_ssh_port.py
 ```
 
-回归测试使用临时目录、模拟 systemctl 和模拟 Telegram API，不需要 root、不操作 `/etc`、不访问 Telegram。Python 测试执行入口脚本内嵌的实际监控代码，覆盖第 11 次阈值、按 IP 清零、游标恢复、队列重试、24 小时窗口、前 10 排名、轮转及压缩日志、IPv6 和监听端口识别。真实 systemd、SSH/PAM 集成和 Telegram 投递仍需在目标 Linux 服务器上验证。
+回归测试使用临时目录、模拟 systemctl、sshd 和 Telegram API，不需要 root、不修改系统配置、不访问 Telegram。Python 测试执行入口脚本内嵌的实际代码，覆盖爆破阈值、排名、端口切换、Include/ListenAddress、多阶段备份、失败回滚以及 socket 部署限制。真实 systemd、SSH/PAM 集成和 Telegram 投递仍需在目标 Linux 服务器上验证。

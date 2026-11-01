@@ -17,6 +17,7 @@ UNIT_FILE=/etc/systemd/system/$UNIT_NAME
 STATE_DIR=/var/lib/ssh-tg-notify
 UNIT_MARKER='# Managed by ssh-tg-notify/v1'
 PYTHON_BIN=
+SSHD_CONFIG=/etc/ssh/sshd_config
 
 error() { printf '错误：%s\n' "$*" >&2; }
 
@@ -727,6 +728,453 @@ test_bruteforce() {
 
 show_failed_ranking() { run_guard_action rank; }
 
+write_port_tool() {
+    cat <<'PORT_TOOL_EOF'
+#!/usr/bin/env python3
+"""Two-stage SSH port changes, with configuration backups and rollback."""
+import argparse
+import glob
+import json
+import os
+from pathlib import Path
+import re
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+
+BEGIN = "# BEGIN ssh-tg-notify ports"
+END = "# END ssh-tg-notify ports"
+SOCKET_MARKER = "# Managed by ssh-tg-notify SSH port changer"
+
+
+def run(arguments):
+    try:
+        result = subprocess.run(arguments, capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError("命令执行失败：" + arguments[0]) from exc
+    if result.returncode:
+        raise RuntimeError("命令失败：" + " ".join(arguments) + "\n" + result.stderr.strip())
+    return result.stdout
+
+
+def parse_ports(text):
+    values = text.replace(",", " ").split()
+    if not values or len(values) > 16 or any(not re.fullmatch(r"[0-9]{1,5}", value) for value in values):
+        raise ValueError("请输入 1–16 个 TCP 端口，用空格或英文逗号分隔。")
+    ports = sorted({int(value) for value in values})
+    if any(not 1 <= value <= 65535 for value in ports):
+        raise ValueError("端口必须在 1–65535 之间。")
+    return ports
+
+
+def directive(line):
+    match = re.match(r"^\s*([A-Za-z][A-Za-z0-9]*)(?:\s*=\s*|\s+)(.*?)\s*$", line)
+    if not match:
+        return "", []
+    return match[1].lower(), shlex.split(match[2], comments=True)
+
+
+def strip_port_block(text):
+    lines, result, inside, starts, ends = text.splitlines(keepends=True), [], False, 0, 0
+    for line in lines:
+        if line.strip() == BEGIN:
+            starts += 1
+            if inside or starts > 1 or ends:
+                raise ValueError("SSH 端口管理标记损坏，请先检查配置。")
+            inside = True
+        elif line.strip() == END:
+            ends += 1
+            if not inside:
+                raise ValueError("SSH 端口管理标记损坏，请先检查配置。")
+            inside = False
+        elif inside:
+            keyword, _ = directive(line)
+            if keyword != "port":
+                raise ValueError("SSH 端口标记块内有其他配置，未修改。")
+        else:
+            result.append(line)
+    if inside or starts != ends:
+        raise ValueError("SSH 端口管理标记不完整，未修改。")
+    return "".join(result)
+
+
+def listen_host(value):
+    if value.startswith("["):
+        match = re.fullmatch(r"\[([^]]+)\](?::([0-9]+))?", value)
+        if not match:
+            raise ValueError("无法识别 ListenAddress：" + value)
+        return match[1], int(match[2]) if match[2] else None
+    if value.count(":") == 1:
+        host, port = value.rsplit(":", 1)
+        if port.isdigit():
+            return host, int(port)
+    return value, None
+
+
+def endpoint(host, port):
+    return f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
+
+
+def effective_ports(settings):
+    ports, defaults = set(), set()
+    for line in settings.splitlines():
+        keyword, arguments = directive(line)
+        if keyword == "port" and arguments:
+            defaults.add(int(arguments[0]))
+        if keyword == "listenaddress" and arguments:
+            _, port = listen_host(arguments[0])
+            if port:
+                ports.add(port)
+    return ports or defaults
+
+
+class ConfigEditor:
+    def __init__(self, main, settings):
+        if main.is_symlink() or main.parent.is_symlink():
+            raise ValueError("SSH 配置入口不应为符号链接。")
+        self.main = main.resolve()
+        self.root = self.main.parent.resolve()
+        self.originals = {}
+        self.defaults = [int(line.split()[1]) for line in settings.splitlines() if line.startswith("port ")]
+        self.defaults = self.defaults or [22]
+        self._visit(self.main, [False], set())
+
+    def _visit(self, path, matching, ancestors):
+        path = path.absolute()
+        if path.is_symlink() or not path.is_file() or self.root not in path.resolve().parents:
+            raise ValueError("只支持 /etc/ssh 内的普通配置文件，不支持外部 Include 或符号链接：" + str(path))
+        path = path.resolve()
+        if path in ancestors:
+            raise ValueError("SSH Include 存在循环引用。")
+        text = path.read_bytes().decode("utf-8", "surrogateescape")
+        if path in self.originals:
+            # Repeated includes can make Match scope ambiguous. Refuse instead
+            # of guessing which occurrence supplies global settings.
+            raise ValueError("SSH 配置重复 Include 同一文件，未修改：" + str(path))
+        self.originals[path] = text
+        for line in text.splitlines():
+            keyword, arguments = directive(line)
+            if keyword == "match":
+                matching[0] = True
+            elif keyword == "include" and not matching[0]:
+                for pattern in arguments:
+                    location = Path(pattern) if Path(pattern).is_absolute() else self.root / pattern
+                    for included in sorted(glob.glob(str(location))):
+                        self._visit(Path(included), matching, ancestors | {path})
+
+    def plan(self, ports, staged, additions=None):
+        outputs, emitted = {}, set()
+        for path, original in self.originals.items():
+            text = strip_port_block(original) if path == self.main else original
+            result, matching = [], False
+            for line in text.splitlines(keepends=True):
+                keyword, arguments = directive(line)
+                if keyword == "match":
+                    matching = True
+                if keyword == "port" and not matching:
+                    result.append("# ssh-tg-notify previous: " + line.rstrip("\r\n") + "\n")
+                elif keyword == "listenaddress" and not matching:
+                    if not arguments or (len(arguments) != 1 and not (len(arguments) == 3 and arguments[1] == "rdomain")):
+                        raise ValueError("无法安全处理 ListenAddress，未修改。")
+                    host, old_port = listen_host(arguments[0])
+                    suffix = " rdomain " + arguments[2] if len(arguments) == 3 else ""
+                    wanted = (set(additions if additions is not None else ports) |
+                              set([old_port] if old_port else self.defaults)) if staged else set(ports)
+                    for port in sorted(wanted):
+                        identity = (host, port, suffix)
+                        if identity not in emitted:
+                            result.append("ListenAddress " + endpoint(host, port) + suffix + "\n")
+                            emitted.add(identity)
+                else:
+                    result.append(line)
+            content = "".join(result)
+            if path == self.main:
+                block = BEGIN + "\n" + "".join(f"Port {port}\n" for port in sorted(ports)) + END + "\n"
+                content = block + content
+            outputs[path] = content.encode("utf-8", "surrogateescape")
+        return outputs
+
+
+def listeners():
+    rows = []
+    for line in run(["ss", "-H", "-ltnp"]).splitlines():
+        fields = line.split()
+        if len(fields) >= 5:
+            host, port = listen_host(fields[3])
+            if port:
+                rows.append((host, port, bool(re.search(r'"sshd(?:-session|-auth)?"', line)), '"systemd"' in line))
+    return rows
+
+
+class SystemdBackend:
+    def __init__(self, defaults_paths=(Path("/etc/default/ssh"), Path("/etc/sysconfig/sshd"))):
+        self.socket = None
+        self.socket_hosts = []
+        self.socket_bindings = set()
+        services, sockets = {}, {}
+        for name in ("ssh.service", "sshd.service", "ssh.socket", "sshd.socket"):
+            try:
+                info = self.info(name)
+            except RuntimeError:
+                continue
+            if info.get("ActiveState") == "active":
+                (sockets if name.endswith(".socket") else services)[info.get("Id", name)] = info
+        if len(sockets) > 1 or len(services) > 1 or not (services or sockets):
+            raise ValueError("需要单一、运行中的 systemd OpenSSH 服务；多个实例或非 systemd 部署请手动修改。")
+        if sockets:
+            self.socket, info = next(iter(sockets.items()))
+            if info.get("Accept") != "no":
+                raise ValueError("暂不自动修改 Accept=yes 的 SSH socket 部署。")
+            targets = [name for name in info.get("Triggers", "").split() if name in ("ssh.service", "sshd.service")]
+            if len(targets) != 1:
+                raise ValueError("无法识别 SSH socket 对应的服务，未修改。")
+            self.service = targets[0]
+            service = self.info(self.service)
+            if service.get("KillMode") != "process":
+                raise ValueError("socket 模式需要服务 KillMode=process 才能保留当前 SSH 会话，未修改。")
+            for address in re.findall(r"(\S+) \(Stream\)", info.get("Listen", "")):
+                if address.isdigit():
+                    self.socket_hosts.append("::")
+                    self.socket_bindings.add(("::", int(address)))
+                else:
+                    host, port = listen_host(address)
+                    if not port or not host or address.startswith("/"):
+                        raise ValueError("只支持 TCP SSH socket，未修改。")
+                    self.socket_hosts.append(host)
+                    self.socket_bindings.add((host, port))
+            if not self.socket_hosts:
+                raise ValueError("无法读取 SSH socket 的监听地址。")
+            self.dropin = Path("/etc/systemd/system") / (self.socket + ".d") / "zz-ssh-tg-notify-ports.conf"
+        else:
+            self.service, service = next(iter(services.items()))
+            if service.get("CanReload") != "yes":
+                raise ValueError("SSH 服务不支持 reload，未修改；不会自动重启并中断会话。")
+        runtime = service.get("ExecStart", "") + " " + service.get("Environment", "")
+        pid = service.get("MainPID", "0")
+        if pid.isdigit() and int(pid):
+            try:
+                runtime += " " + Path(f"/proc/{pid}/cmdline").read_bytes().replace(b"\0", b" ").decode(errors="replace")
+            except OSError:
+                raise ValueError("无法读取 SSH 服务进程信息，未修改。")
+        for defaults in defaults_paths:
+            if defaults.is_file():
+                runtime += " " + " ".join(line for line in defaults.read_text(errors="replace").splitlines()
+                                            if line.strip() and not line.lstrip().startswith("#"))
+        if re.search(r"(?:^|[\s=\"'])-[fpo]", runtime):
+            raise ValueError("SSH 使用 -f/-p/-o 启动参数覆盖配置，未修改；请先按实际服务配置处理。")
+
+    @staticmethod
+    def info(name):
+        output = run(["systemctl", "show", name, "--property=Id,ActiveState,Accept,Triggers,Listen,KillMode,CanReload,ExecStart,Environment,MainPID"])
+        return dict(line.split("=", 1) for line in output.splitlines() if "=" in line)
+
+    def socket_plan(self, ports, staged, additions=None):
+        if not self.socket:
+            return {}
+        if self.dropin.is_symlink() or (self.dropin.exists() and not self.dropin.read_text().startswith(SOCKET_MARKER + "\n")):
+            raise ValueError("SSH socket 端口覆盖文件不属于本脚本，未修改。")
+        bindings = {(host, port) for host in self.socket_hosts for port in (additions if staged and additions is not None else ports)}
+        if staged:
+            bindings.update(self.socket_bindings)
+        addresses = sorted(endpoint(host, port) for host, port in bindings)
+        text = SOCKET_MARKER + "\n[Socket]\nListenStream=\n" + "".join("ListenStream=" + value + "\n" for value in addresses)
+        return {self.dropin: text.encode()}
+
+    def apply(self):
+        if self.socket:
+            run(["systemctl", "daemon-reload"])
+            run(["systemctl", "restart", self.socket, self.service])
+        else:
+            run(["systemctl", "reload", self.service])
+
+    def verify(self, required, removed):
+        for _ in range(30):
+            rows = listeners()
+            active = {port for _, port, ssh, systemd in rows if ssh or (self.socket and systemd)}
+            if set(required) <= active and not (set(removed) & active):
+                return
+            time.sleep(0.2)
+        raise RuntimeError("新 SSH 端口未正确监听，可能被 SELinux 拒绝或服务未采用新配置。")
+
+
+def atomic_write(path, data):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.is_symlink() or path.parent.is_symlink():
+        raise ValueError("配置路径不应为符号链接：" + str(path))
+    descriptor, name = tempfile.mkstemp(prefix=".ssh-tg-port-", dir=str(path.parent))
+    os.close(descriptor)
+    temporary = Path(name)
+    try:
+        if path.exists():
+            run(["cp", "--preserve=all", "--", str(path), str(temporary)])
+        else:
+            temporary.chmod(0o644)
+        temporary.write_bytes(data)
+        os.replace(str(temporary), str(path))
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+class Transaction:
+    def __init__(self, sshd, config, backend, backup_root):
+        self.sshd, self.config, self.backend = sshd, config, backend
+        backup_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if backup_root.is_symlink():
+            raise ValueError("备份目录不应为符号链接。")
+        self.backup = Path(tempfile.mkdtemp(prefix=time.strftime("%Y%m%d-%H%M%S-"), dir=str(backup_root)))
+
+    def apply(self, plan, required, removed=(), previous=None):
+        originals, written, reloading = {}, [], False
+        phase = self.backup / str(len(list(self.backup.iterdir())) + 1)
+        phase.mkdir(mode=0o700)
+        for index, path in enumerate(plan):
+            if path.is_symlink() or path.parent.is_symlink():
+                raise ValueError("配置路径不应为符号链接：" + str(path))
+            originals[path] = path.read_bytes() if path.exists() else None
+            if path.exists():
+                run(["cp", "--preserve=all", "--", str(path), str(phase / str(index))])
+        (phase / "manifest.json").write_text(json.dumps({str(path): str(index) if originals[path] is not None else None
+                                                        for index, path in enumerate(plan)}, indent=2), encoding="utf-8")
+        try:
+            for path, data in plan.items():
+                if (path.read_bytes() if path.exists() else None) != originals[path]:
+                    raise RuntimeError("操作期间配置被其他程序修改，已取消。")
+                if originals[path] == data:
+                    continue
+                atomic_write(path, data)
+                written.append(path)
+            run([self.sshd, "-t", "-f", str(self.config)])
+            settings = run([self.sshd, "-T", "-f", str(self.config)])
+            if effective_ports(settings) != set(required):
+                raise RuntimeError("有效 SSH 端口与目标不一致，请检查 Include、ListenAddress 或启动参数。")
+            reloading = True
+            self.backend.apply()
+            self.backend.verify(required, removed)
+        except BaseException:
+            failures = []
+            for path in reversed(written):
+                try:
+                    if not path.exists() or path.read_bytes() != plan[path]:
+                        raise RuntimeError("回滚前配置又被其他程序修改")
+                    old = originals[path]
+                    if old is None:
+                        path.unlink()
+                    else:
+                        atomic_write(path, old)
+                except Exception:
+                    failures.append(str(path))
+            if reloading and not failures:
+                try:
+                    run([self.sshd, "-t", "-f", str(self.config)])
+                    self.backend.apply()
+                    if previous is not None:
+                        self.backend.verify(previous, ())
+                except Exception:
+                    failures.append("SSH 服务重新加载")
+            if failures:
+                print("自动回滚未完成：" + "、".join(failures) + "；备份：" + str(self.backup), file=sys.stderr)
+            else:
+                print("本阶段修改已回滚；备份：" + str(self.backup), file=sys.stderr)
+            raise
+
+
+def change(config, backup_root, prompt=input):
+    for program in ("sshd", "ss", "systemctl", "cp"):
+        if not shutil.which(program):
+            raise ValueError("缺少依赖：" + program)
+    sshd = shutil.which("sshd")
+    run([sshd, "-t", "-f", str(config)])
+    settings = run([sshd, "-T", "-f", str(config)])
+    backend = SystemdBackend()
+    old = {port for _, port in backend.socket_bindings} if backend.socket else effective_ports(settings)
+    rows = listeners()
+    current = {port for _, port, ssh, systemd in rows if ssh or (backend.socket and systemd and port in old)}
+    if not old or current != old:
+        raise ValueError("SSH 实际监听端口与配置不一致，未修改；请先排查多个实例或 socket 配置覆盖。")
+    print("当前 SSH 端口：" + "、".join(map(str, sorted(old))))
+    try:
+        text = prompt("请输入新的 SSH 端口（多个用空格分隔，留空取消）: ").strip()
+    except EOFError:
+        return
+    if not text:
+        print("已取消，未修改配置。")
+        return
+    desired = set(parse_ports(text))
+    if desired == old:
+        print("与当前端口相同，无需修改。")
+        return
+    occupied = {port for _, port, _, _ in rows}
+    if (desired - old) & occupied:
+        raise ValueError("目标端口已被占用：" + "、".join(map(str, sorted((desired - old) & occupied))))
+    editor = ConfigEditor(config, settings)
+    transaction = Transaction(sshd, config, backend, backup_root)
+    staged = desired | old
+    plan = editor.plan(staged, staged=not bool(backend.socket), additions=desired)
+    plan.update(backend.socket_plan(staged, staged=True, additions=desired))
+    transaction.apply(plan, staged, previous=old)
+    print("新端口已监听，旧端口仍保留。备份目录：" + str(transaction.backup))
+    print("请先在防火墙和云安全组放行新 TCP 端口，并另开连接验证：")
+    for port in sorted(desired):
+        print(f"  ssh -p {port} 用户@服务器IP")
+    if staged == desired:
+        print("已按指定列表设置 SSH 端口。")
+        return
+    try:
+        answer = prompt("确认已通过新端口成功登录？输入 yes 关闭旧端口，其他输入保留双端口: ")
+    except (EOFError, KeyboardInterrupt):
+        answer = ""
+    if answer.strip().lower() != "yes":
+        print("已保留旧、新端口。验证完成后可再次选择修改端口，并只输入需要保留的端口。")
+        return
+    final_plan = editor.plan(desired, staged=False)
+    final_plan.update(backend.socket_plan(desired, staged=False))
+    transaction.apply(final_plan, desired, old - desired, previous=staged)
+    print("SSH 端口修改成功：" + "、".join(map(str, sorted(desired))))
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", type=Path, default=Path("/etc/ssh/sshd_config"))
+    parser.add_argument("--backup-root", type=Path, default=Path("/var/backups/ssh-tg-notify-ports"))
+    args = parser.parse_args()
+    os.umask(0o077)
+    if hasattr(os, "geteuid") and os.geteuid() != 0:
+        print("请以 root 身份运行。", file=sys.stderr)
+        return 1
+    def interrupted(_number, _frame):
+        raise KeyboardInterrupt
+    signal.signal(signal.SIGTERM, interrupted)
+    try:
+        change(args.config, args.backup_root)
+    except KeyboardInterrupt:
+        print("操作已中断，请保留当前连接并检查端口状态。", file=sys.stderr)
+        return 130
+    except Exception as exc:
+        print("修改失败：" + str(exc), file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+PORT_TOOL_EOF
+}
+
+change_ssh_port() (
+    local program=
+    require_python || return 1
+    trap '[[ -z $program ]] || rm -f -- "$program"' EXIT
+    umask 077
+    program=$(mktemp "${TMPDIR:-/tmp}/ssh-tg-port.XXXXXX") || return 1
+    write_port_tool > "$program" || return 1
+    "$PYTHON_BIN" -I "$program" --config "$SSHD_CONFIG" <&3
+)
+
 remove_bruteforce() {
     check_monitor_paths || return 1
     if owned_unit; then
@@ -910,7 +1358,7 @@ with_lock() (
 
 usage() {
     cat <<'USAGE_EOF'
-用法：bash ssh-tg-notify.sh [install|show|test|enable-bruteforce|disable-bruteforce|test-bruteforce|rank|uninstall]
+用法：bash ssh-tg-notify.sh [install|show|test|enable-bruteforce|disable-bruteforce|test-bruteforce|rank|uninstall|change-port]
 不带参数时显示菜单。install 交互读取服务器名称、TG_BOT_TOKEN、TG_CHAT_ID。
 请以 root 身份在支持 PAM 的 Linux OpenSSH 服务器运行。
 USAGE_EOF
@@ -920,7 +1368,7 @@ main() {
     local action=${1:-menu} choice dependency
     case $action in -h|--help|help) usage; return 0 ;; esac
     [[ $# -le 1 ]] || { usage >&2; return 1; }
-    case $action in menu|install|show|test|enable-bruteforce|disable-bruteforce|test-bruteforce|rank|uninstall) ;; *) usage >&2; return 1 ;; esac
+    case $action in menu|install|show|test|enable-bruteforce|disable-bruteforce|test-bruteforce|rank|uninstall|change-port) ;; *) usage >&2; return 1 ;; esac
     [[ $EUID -eq 0 ]] || { error '请先执行 sudo -i，再运行脚本。'; return 1; }
     [[ $(uname -s) == Linux ]] || { error '本脚本仅适用于 Linux。'; return 1; }
     PATH=/usr/sbin:/usr/bin:/sbin:/bin
@@ -941,10 +1389,11 @@ main() {
         test-bruteforce) with_lock test_bruteforce; return $? ;;
         rank) with_lock show_failed_ranking; return $? ;;
         uninstall) with_lock uninstall_notification; return $? ;;
+        change-port) with_lock change_ssh_port; return $? ;;
     esac
     while true; do
-        printf '\nSSH 登录 Telegram 通知\n1. 添加 SSH 登录通知\n2. 查看通知配置\n3. 发送测试通知\n4. 开启爆破通知\n5. 关闭爆破通知\n6. 发送爆破测试通知\n7. 查看失败排名\n8. 卸载全部\n0. 退出\n'
-        read_field choice '请选择 [0-8]: ' || { printf '\n'; return 0; }
+        printf '\nSSH 登录 Telegram 通知\n1. 添加 SSH 登录通知\n2. 查看通知配置\n3. 发送测试通知\n4. 开启爆破通知\n5. 关闭爆破通知\n6. 发送爆破测试通知\n7. 查看失败排名\n8. 卸载全部\n9. 更改 SSH 端口\n0. 退出\n'
+        read_field choice '请选择 [0-9]: ' || { printf '\n'; return 0; }
         case $choice in
             1) with_lock install_notification ;;
             2) with_lock show_notification ;;
@@ -954,8 +1403,9 @@ main() {
             6) with_lock test_bruteforce ;;
             7) with_lock show_failed_ranking ;;
             8) with_lock uninstall_notification ;;
+            9) with_lock change_ssh_port ;;
             0) return 0 ;;
-            *) echo '无效选项，请输入 0 到 8。' ;;
+            *) echo '无效选项，请输入 0 到 9。' ;;
         esac
     done
 }
