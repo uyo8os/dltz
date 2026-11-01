@@ -11,6 +11,12 @@ BEGIN_MARKER='# BEGIN ssh-tg-notify'
 END_MARKER='# END ssh-tg-notify'
 PAM_ENTRY="session optional pam_exec.so quiet type=open_session $NOTIFIER"
 CURL_BIN=
+GUARD=$INSTALL_DIR/guard.py
+UNIT_NAME=ssh-tg-notify-bruteforce.service
+UNIT_FILE=/etc/systemd/system/$UNIT_NAME
+STATE_DIR=/var/lib/ssh-tg-notify
+UNIT_MARKER='# Managed by ssh-tg-notify/v1'
+PYTHON_BIN=
 
 error() { printf '错误：%s\n' "$*" >&2; }
 
@@ -94,6 +100,400 @@ owned_install() {
        $(cat "$INSTALL_DIR/managed") == ssh-tg-notify/v1 ]]
 }
 
+write_guard() {
+    cat <<'GUARD_EOF'
+#!/usr/bin/env python3
+"""SSH authentication log reader and persistent brute-force monitor (stdlib only)."""
+import argparse
+import collections
+import datetime as dt
+import gzip
+import ipaddress
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import signal
+import sqlite3
+import stat
+import subprocess
+import sys
+import threading
+import time
+import urllib.parse
+import urllib.request
+
+AUTH = re.compile(r"^(Failed|Accepted) \S+ for (?:invalid user )?(.*?) from (\S+) port (\d+) ssh2(?:\b|:)")
+PREFIX = re.compile(r"\bsshd(?:-session|-auth)?\[\d+\]:\s*(.*)$")
+IDENTIFIERS = ("sshd", "sshd-session", "sshd-auth")
+MONTHS = {name: n for n, name in enumerate("Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec".split(), 1)}
+
+
+def parse_auth(message):
+    if not isinstance(message, str):
+        return None
+    match = AUTH.match(message)
+    if not match:
+        return None
+    try:
+        address = ipaddress.ip_address(match[3].strip("[]"))
+        if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped:
+            address = address.ipv4_mapped
+    except ValueError:
+        return None
+    return {"failed": match[1] == "Failed", "user": match[2], "ip": str(address)}
+
+
+def journal_command():
+    command = ["journalctl", "--no-pager", "--output=json"]
+    for identifier in IDENTIFIERS:
+        command.extend(["--identifier", identifier])
+    return command
+
+
+def decode_record(line):
+    try:
+        record = json.loads(line)
+        stamp = int(record["__REALTIME_TIMESTAMP"]) / 1_000_000
+        if not isinstance(record.get("MESSAGE"), str):
+            return None
+        return stamp, record
+    except (ValueError, TypeError, KeyError):
+        return None
+
+
+def journal_counts(since, until):
+    """Return (counts, available SSH records); never combine with syslog copies."""
+    counts, records = collections.Counter(), 0
+    if not shutil.which("journalctl"):
+        return counts, 0
+    command = journal_command() + [f"--since=@{since:.6f}", f"--until=@{until:.6f}"]
+    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                               text=True, encoding="utf-8", errors="replace")
+    try:
+        for line in process.stdout:
+            decoded = decode_record(line)
+            if not decoded or not since <= decoded[0] <= until:
+                continue
+            records += 1
+            event = parse_auth(decoded[1]["MESSAGE"])
+            if event and event["failed"]:
+                counts[event["ip"]] += 1
+    finally:
+        process.stdout.close()
+        result = process.wait()
+    if result:
+        raise RuntimeError("无法完整读取 systemd 日志，请先检查 journalctl 权限和服务状态。")
+    return counts, records
+
+
+def syslog_time(line, now):
+    first = line.split(" ", 1)[0]
+    try:
+        return dt.datetime.fromisoformat(first.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        pass
+    match = re.match(r"^([A-Z][a-z]{2})\s+(\d{1,2})\s+(\d{2}):(\d{2}):(\d{2})\s", line)
+    if not match or match[1] not in MONTHS:
+        return None
+    # Classic syslog has no year. Choose the nearest local date, including
+    # Dec/Jan rotation and DST, instead of treating every line as this year.
+    candidates = []
+    for year in range(time.localtime(now).tm_year - 1, time.localtime(now).tm_year + 2):
+        try:
+            value = dt.datetime(year, MONTHS[match[1]], *map(int, match.groups()[1:]))
+            candidates.append(time.mktime(value.timetuple()))
+        except (ValueError, OverflowError):
+            continue
+    return min(candidates, key=lambda value: abs(now - value)) if candidates else None
+
+
+def file_counts(since, until, directory=Path("/var/log")):
+    counts = collections.Counter()
+    for name in ("auth.log", "secure"):
+        paths = [path for path in directory.glob(name + "*")
+                 if re.fullmatch(re.escape(name) + r"(?:(?:\.\d+|-\d{8})(?:\.gz)?)?", path.name)
+                 and path.is_file() and not path.is_symlink()]
+        if not paths:
+            continue
+        seen = set()
+        for path in paths:
+            identity = (path.stat().st_dev, path.stat().st_ino)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            opener = gzip.open if path.suffix == ".gz" else open
+            with opener(path, "rt", encoding="utf-8", errors="replace") as stream:
+                for line in stream:
+                    prefix = PREFIX.search(line)
+                    if not prefix:
+                        continue
+                    stamp = syslog_time(line, until)
+                    if stamp is None or not since <= stamp <= until:
+                        continue
+                    event = parse_auth(prefix[1])
+                    if event and event["failed"]:
+                        counts[event["ip"]] += 1
+        return counts, True
+    return counts, False
+
+
+def ranking(now=None):
+    until = time.time() if now is None else now
+    counts, records = journal_counts(until - 86400, until)
+    if not records:
+        counts, available = file_counts(until - 86400, until)
+        if not available and not shutil.which("journalctl"):
+            raise RuntimeError("未找到 journalctl 或可读取的 auth.log / secure 日志。")
+    return sorted(counts.items(), key=lambda item: (-item[1], item[0]))[:10]
+
+
+def read_config(path):
+    mode = path.lstat()
+    if not stat.S_ISREG(mode.st_mode):
+        raise ValueError("通知配置必须是普通文件。")
+    if os.name == "posix" and mode.st_uid != os.geteuid():
+        raise ValueError("通知配置属主不正确。")
+    values = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        key, separator, value = line.partition("=")
+        if not separator or key not in ("SERVER_NAME", "TG_BOT_TOKEN", "TG_CHAT_ID") or key in values:
+            raise ValueError("通知配置损坏。")
+        values[key] = value
+    server = values.get("SERVER_NAME", "")
+    if (not server.strip() or len(server) > 128 or any(ord(c) < 32 or ord(c) == 127 for c in server)
+            or not re.fullmatch(r"[0-9]+:[A-Za-z0-9_-]+", values.get("TG_BOT_TOKEN", ""))
+            or not re.fullmatch(r"-?[0-9]+", values.get("TG_CHAT_ID", ""))):
+        raise ValueError("通知配置损坏。")
+    return values
+
+
+def send_telegram(config, message):
+    data = urllib.parse.urlencode({"chat_id": config["TG_CHAT_ID"], "text": message}).encode()
+    request = urllib.request.Request(
+        "https://api.telegram.org/bot" + config["TG_BOT_TOKEN"] + "/sendMessage", data=data)
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        with opener.open(request, timeout=8) as response:
+            return json.load(response).get("ok") is True
+    except Exception:
+        # urllib errors can contain the credential-bearing URL. Never log them.
+        return False
+
+
+def output_of(command):
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, timeout=5, check=False)
+        return result.stdout if result.returncode == 0 else ""
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+
+
+def ssh_ports():
+    ports = set()
+    for line in output_of(["ss", "-H", "-ltnp"]).splitlines():
+        fields = line.split()
+        if len(fields) >= 5 and re.search(r'"sshd(?:-session|-auth)?"', line):
+            port = fields[3].rsplit(":", 1)[-1]
+            if port.isdigit():
+                ports.add(int(port))
+    # Socket activation may leave the listener owned by systemd.
+    if not ports:
+        sockets = "\n\n".join(output_of(["systemctl", "show", unit, "--property=Listen", "--property=ActiveState"])
+                              for unit in ("ssh.socket", "sshd.socket"))
+        for block in sockets.split("\n\n"):
+            if "ActiveState=active" in block.splitlines():
+                ports.update(int(port) for port in re.findall(r"(?:^|:|=|\s)(\d+)\s+\(Stream\)", block))
+    if not ports:
+        settings = output_of(["sshd", "-T"])
+        for address in re.findall(r"^listenaddress (\S+)$", settings, re.MULTILINE):
+            port = address.rsplit(":", 1)[-1]
+            if port.isdigit():
+                ports.add(int(port))
+        if not ports:
+            ports.update(int(port) for port in re.findall(r"^port (\d+)$", settings, re.MULTILINE))
+    return "、".join(str(port) for port in sorted(ports) if 0 < port < 65536) or "未知"
+
+
+def alert_message(config, event, ports, testing=False):
+    user = "".join(c if c.isprintable() else "?" for c in event["user"])[:128] or "未知"
+    stamp = dt.datetime.fromtimestamp(event["time"]).astimezone().strftime("%Y-%m-%d %H:%M:%S %z")
+    title = "🚨 SSH 爆破提醒（测试）" if testing else "🚨 SSH 爆破提醒"
+    return (f'{title}\n• 服务器: {config["SERVER_NAME"]}\n• 用户: {user}\n'
+            f'• 来源 IP: {event["ip"]}\n• 失败次数：{event["count"]}\n• 端口：{ports}\n• 时间: {stamp}')
+
+
+class Store:
+    def __init__(self, path):
+        self.connection = sqlite3.connect(str(path), timeout=10)
+        self.connection.execute("PRAGMA journal_mode=WAL")
+        self.connection.executescript("""
+            CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS streaks (ip TEXT PRIMARY KEY, count INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS outbox (
+                id INTEGER PRIMARY KEY, payload TEXT NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0, due REAL NOT NULL DEFAULT 0);
+        """)
+        with self.connection:
+            self.connection.execute("INSERT OR IGNORE INTO meta VALUES ('start', ?)", (str(time.time()),))
+
+    def meta(self, key):
+        row = self.connection.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+        return row[0] if row else None
+
+    def reset_streaks(self):
+        with self.connection:
+            self.connection.execute("DELETE FROM streaks")
+            self.connection.execute("DELETE FROM meta WHERE key='cursor'")
+            self.connection.execute("INSERT OR REPLACE INTO meta VALUES ('start', ?)", (str(time.time()),))
+
+    def consume(self, record):
+        cursor = record.get("__CURSOR")
+        if not isinstance(cursor, str) or not cursor or cursor == self.meta("cursor"):
+            return
+        event = parse_auth(record.get("MESSAGE"))
+        with self.connection:
+            if event:
+                if not event["failed"]:
+                    self.connection.execute("DELETE FROM streaks WHERE ip=?", (event["ip"],))
+                else:
+                    row = self.connection.execute("SELECT count FROM streaks WHERE ip=?", (event["ip"],)).fetchone()
+                    event["count"] = (row[0] if row else 0) + 1
+                    self.connection.execute("INSERT OR REPLACE INTO streaks VALUES (?, ?)", (event["ip"], event["count"]))
+                    if event["count"] == 11:
+                        event["time"] = int(record["__REALTIME_TIMESTAMP"]) / 1_000_000
+                        self.connection.execute("INSERT INTO outbox(payload) VALUES (?)", (json.dumps(event),))
+            self.connection.execute("INSERT OR REPLACE INTO meta VALUES ('cursor', ?)", (cursor,))
+
+    def deliver_one(self, config, sender=send_telegram, ports=ssh_ports, now=None):
+        now = time.time() if now is None else now
+        row = self.connection.execute("SELECT id, payload, attempts FROM outbox WHERE due<=? ORDER BY id LIMIT 1", (now,)).fetchone()
+        if not row:
+            return None
+        sent = sender(config, alert_message(config, json.loads(row[1]), ports()))
+        with self.connection:
+            if sent:
+                self.connection.execute("DELETE FROM outbox WHERE id=?", (row[0],))
+            else:
+                delay = min(300, 5 * 2 ** min(row[2], 6))
+                self.connection.execute("UPDATE outbox SET attempts=attempts+1, due=? WHERE id=?", (now + delay, row[0]))
+        return sent
+
+    def close(self):
+        self.connection.close()
+
+
+def cursor_exists(cursor):
+    output = output_of(journal_command() + ["--cursor=" + cursor, "--lines=1"])
+    for line in output.splitlines():
+        decoded = decode_record(line)
+        if decoded and decoded[1].get("__CURSOR") == cursor:
+            return True
+    return False
+
+
+def watch(config_path, state_dir):
+    import fcntl
+    read_config(config_path)
+    # Manager creates and owns this directory; reject unexpected replacements.
+    if state_dir.is_symlink() or not state_dir.is_dir():
+        raise ValueError("爆破状态目录不存在或不安全。")
+    database = state_dir / "state.sqlite3"
+    if database.is_symlink():
+        raise ValueError("爆破状态文件不应为符号链接。")
+    with open(state_dir / "watch.lock", "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        store = Store(database)
+        cursor = store.meta("cursor")
+        if cursor and not cursor_exists(cursor):
+            print("SSH journal cursor expired; resetting consecutive failure counts.", flush=True)
+            store.reset_streaks()
+            cursor = None
+        command = journal_command() + ["--follow", "--lines=all"]
+        command += ["--after-cursor=" + cursor] if cursor else ["--since=@" + store.meta("start")]
+        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                   text=True, encoding="utf-8", errors="replace")
+        stop = threading.Event()
+        sender_failed = threading.Event()
+
+        def shutdown(_number, _frame):
+            stop.set()
+            if process.poll() is None:
+                process.terminate()
+
+        def deliver():
+            sender_store = Store(database)
+            try:
+                while not stop.is_set():
+                    result = sender_store.deliver_one(read_config(config_path))
+                    if result is False:
+                        print("Telegram brute-force notification failed; queued for retry.", flush=True)
+                    if result is None or result is False:
+                        stop.wait(1)
+            except Exception:
+                print("Brute-force sender failed; restarting monitor.", flush=True)
+                sender_failed.set()
+                shutdown(None, None)
+            finally:
+                sender_store.close()
+
+        signal.signal(signal.SIGTERM, shutdown)
+        signal.signal(signal.SIGINT, shutdown)
+        thread = threading.Thread(target=deliver, daemon=True)
+        thread.start()
+        try:
+            for line in process.stdout:
+                decoded = decode_record(line)
+                if decoded:
+                    store.consume(decoded[1])
+            if sender_failed.is_set() or not stop.is_set():
+                raise RuntimeError("journalctl 监控意外退出。")
+        finally:
+            stop.set()
+            if process.poll() is None:
+                process.terminate()
+            process.wait(timeout=5)
+            process.stdout.close()
+            thread.join(timeout=10)
+            store.close()
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("action", choices=("rank", "test", "watch"))
+    parser.add_argument("--config", type=Path, default=Path("/etc/ssh-tg-notify/config"))
+    parser.add_argument("--state-dir", type=Path, default=Path("/var/lib/ssh-tg-notify"))
+    args = parser.parse_args()
+    os.umask(0o077)
+    try:
+        if args.action == "rank":
+            rows = ranking()
+            for address, count in rows:
+                print(f"{count}次 {address}")
+            if not rows:
+                print("近 24 小时没有可统计的 SSH 登录失败记录。")
+        elif args.action == "test":
+            config = read_config(args.config)
+            event = {"user": "root", "ip": "203.0.113.10", "count": 11, "time": time.time()}
+            if not send_telegram(config, alert_message(config, event, ssh_ports(), testing=True)):
+                raise RuntimeError("爆破测试通知发送失败，请检查配置和网络。")
+            print("爆破测试通知已发送（模拟数据，不改变监控状态）。")
+        else:
+            watch(args.config, args.state_dir)
+    except Exception as exc:
+        # Only expose our own messages; network/OS exceptions might carry secrets.
+        message = str(exc) if type(exc) in (ValueError, RuntimeError) else "日志读取或监控失败，请检查权限、依赖和日志服务。"
+        print(message, file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+GUARD_EOF
+}
+
 # Return absent / installed / conflict. Unexpected edits or duplicate hooks
 # must not be silently accepted or removed.
 pam_state() {
@@ -172,11 +572,180 @@ read_install_config() {
     }
 }
 
+require_login_notification() {
+    owned_install && load_config && [[ $(pam_state) == installed &&
+        -f $NOTIFIER && ! -L $NOTIFIER && -x $NOTIFIER ]] || {
+        error '请先选择“1. 添加 SSH 登录通知”，完整配置后才能使用爆破通知。'; return 1;
+    }
+}
+
+require_python() {
+    PYTHON_BIN=$(command -v python3) || { error '需要 Python 3，请先安装 python3。'; return 1; }
+    "$PYTHON_BIN" -I -c 'import sqlite3, urllib.request, ipaddress; import sys; sys.exit(sys.version_info < (3, 8))' || {
+        error '需要 Python 3.8 或更新版本及标准库 sqlite3。'; return 1;
+    }
+}
+
+check_bruteforce_dependencies() {
+    require_python || return 1
+    command -v systemctl >/dev/null 2>&1 && command -v journalctl >/dev/null 2>&1 &&
+        [[ -d /run/systemd/system ]] || {
+        error '爆破通知需要运行中的 systemd 和 journald。'; return 1;
+    }
+    systemctl is-active --quiet systemd-journald.service || {
+        error 'systemd-journald 未运行，无法监控 SSH 日志。'; return 1;
+    }
+    journalctl --no-pager --lines=0 >/dev/null 2>&1 || {
+        error '无法读取 systemd 日志。'; return 1;
+    }
+}
+
+owned_unit() {
+    [[ -f $UNIT_FILE && ! -L $UNIT_FILE && -O $UNIT_FILE ]] && grep -Fxq "$UNIT_MARKER" "$UNIT_FILE"
+}
+
+check_monitor_paths() {
+    if [[ -e $UNIT_FILE || -L $UNIT_FILE ]] && ! owned_unit; then
+        error "$UNIT_FILE 不属于本脚本，拒绝覆盖或删除。"; return 1
+    fi
+    if [[ -e $STATE_DIR || -L $STATE_DIR ]]; then
+        [[ -d $STATE_DIR && ! -L $STATE_DIR && -O $STATE_DIR &&
+           -f $STATE_DIR/managed && ! -L $STATE_DIR/managed &&
+           $(cat "$STATE_DIR/managed") == ssh-tg-notify-bruteforce/v1 ]] || {
+            error "$STATE_DIR 不属于本脚本，拒绝覆盖或删除。"; return 1;
+        }
+    fi
+}
+
+write_guard_unit() {
+    cat <<UNIT_EOF
+$UNIT_MARKER
+[Unit]
+Description=SSH brute-force Telegram notifications
+Wants=network-online.target
+After=network-online.target systemd-journald.service
+
+[Service]
+Type=simple
+ExecStart="$PYTHON_BIN" -I "$GUARD" watch --config "$CONFIG_FILE" --state-dir "$STATE_DIR"
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=$STATE_DIR
+
+[Install]
+WantedBy=multi-user.target
+UNIT_EOF
+}
+
+bruteforce_status() {
+    if ! owned_unit; then
+        echo '爆破通知: 未开启'
+    elif ! command -v systemctl >/dev/null 2>&1; then
+        echo '爆破通知: 无法读取服务状态'
+    elif systemctl is-active --quiet "$UNIT_NAME"; then
+        echo '爆破通知: 运行中'
+    elif systemctl is-enabled --quiet "$UNIT_NAME"; then
+        echo '爆破通知: 已设为开机启动，但当前未运行（请检查服务日志）'
+    else
+        echo '爆破通知: 已关闭'
+    fi
+}
+
+enable_bruteforce() (
+    local guard_temp= unit_temp=
+    require_login_notification || return 1
+    check_bruteforce_dependencies || return 1
+    check_monitor_paths || return 1
+    if owned_unit && [[ -f $GUARD && ! -L $GUARD ]] && systemctl is-active --quiet "$UNIT_NAME"; then
+        systemctl enable "$UNIT_NAME" >/dev/null 2>&1 || { error '设置开机启动失败。'; return 1; }
+        echo '爆破通知已开启，跳过重复启用。'; return 0
+    fi
+    [[ ! -L $GUARD ]] || { error '监控程序不应为符号链接。'; return 1; }
+    # Stop any previously installed instance before resetting its state.
+    if owned_unit; then
+        systemctl stop "$UNIT_NAME" || { error '停止旧监控失败，未修改配置。'; return 1; }
+    fi
+    umask 077
+    if [[ ! -d $STATE_DIR ]]; then
+        mkdir -m 700 -- "$STATE_DIR" && printf 'ssh-tg-notify-bruteforce/v1\n' > "$STATE_DIR/managed" || return 1
+    fi
+    chmod 700 "$STATE_DIR" || return 1
+    # Turning monitoring off and on begins a fresh streak, not a replay of
+    # attacks that happened while monitoring was disabled.
+    rm -f -- "$STATE_DIR/state.sqlite3" "$STATE_DIR/state.sqlite3-wal" \
+        "$STATE_DIR/state.sqlite3-shm" "$STATE_DIR/watch.lock" || return 1
+    trap '[[ -z $guard_temp ]] || rm -f -- "$guard_temp"; [[ -z $unit_temp ]] || rm -f -- "$unit_temp"' EXIT
+    guard_temp=$(mktemp "$INSTALL_DIR/.guard.XXXXXX") || return 1
+    unit_temp=$(mktemp "${UNIT_FILE}.XXXXXX") || return 1
+    if ! write_guard > "$guard_temp" || ! write_guard_unit > "$unit_temp" ||
+       ! "$PYTHON_BIN" -I -c 'import ast,pathlib,sys; ast.parse(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))' "$guard_temp" ||
+       ! chmod 600 "$guard_temp" || ! chmod 644 "$unit_temp" ||
+       ! mv -fT -- "$guard_temp" "$GUARD" || ! mv -fT -- "$unit_temp" "$UNIT_FILE"; then
+        error '准备爆破监控程序失败，未开启服务。'; return 1
+    fi
+    guard_temp= unit_temp=
+    if ! systemctl daemon-reload || ! systemctl enable --now "$UNIT_NAME" ||
+       ! systemctl is-active --quiet "$UNIT_NAME"; then
+        systemctl disable --now "$UNIT_NAME" >/dev/null 2>&1 || :
+        error "爆破通知启动失败，已尝试停用。请查看 journalctl -u $UNIT_NAME。"
+        return 1
+    fi
+    echo '爆破通知已开启，并设置为开机启动。'
+    echo '同一 IP 连续失败第 11 次时提醒一次，成功认证后清零；本次开启从新日志开始统计。'
+)
+
+disable_bruteforce() {
+    check_monitor_paths || return 1
+    if ! owned_unit; then
+        echo '爆破通知尚未开启或已经关闭。'; return 0
+    fi
+    command -v systemctl >/dev/null 2>&1 || { error '无法找到 systemctl，未修改监控文件。'; return 1; }
+    systemctl disable --now "$UNIT_NAME" || { error '关闭爆破通知失败，未删除监控文件。'; return 1; }
+    echo '爆破通知已关闭，SSH 登录成功通知继续保留。'
+}
+
+run_guard_action() (
+    local action=$1 program=
+    require_python || return 1
+    trap '[[ -z $program ]] || rm -f -- "$program"' EXIT
+    umask 077
+    program=$(mktemp "${TMPDIR:-/tmp}/ssh-tg-guard.XXXXXX") || return 1
+    write_guard > "$program" || return 1
+    "$PYTHON_BIN" -I "$program" "$action" --config "$CONFIG_FILE"
+)
+
+test_bruteforce() {
+    require_login_notification || return 1
+    run_guard_action test
+}
+
+show_failed_ranking() { run_guard_action rank; }
+
+remove_bruteforce() {
+    check_monitor_paths || return 1
+    if owned_unit; then
+        disable_bruteforce || return 1
+        rm -f -- "$UNIT_FILE" || return 1
+        systemctl daemon-reload || { error '服务配置重新加载失败，请检查 systemd。'; return 1; }
+    fi
+    if [[ -d $STATE_DIR ]]; then
+        rm -f -- "$STATE_DIR/state.sqlite3" "$STATE_DIR/state.sqlite3-wal" \
+            "$STATE_DIR/state.sqlite3-shm" "$STATE_DIR/watch.lock" "$STATE_DIR/managed" || return 1
+        rmdir -- "$STATE_DIR" 2>/dev/null || echo "状态目录 $STATE_DIR 含其他文件，已保留目录。"
+    fi
+}
+
 # Deliberately remove only known filenames, never recurse through /etc.
 remove_files() {
     local directory=$1
     rm -f -- "$directory/config" "$directory/notify.sh" \
-        "$directory/managed" "$directory/sshd.pam.backup" || return 1
+        "$directory/managed" "$directory/sshd.pam.backup" "$directory/guard.py" || return 1
     if [[ -d $directory ]]; then
         rmdir -- "$directory" 2>/dev/null || {
             printf '目录 %s 内还有其他文件，已保留该目录。\n' "$directory"
@@ -287,6 +856,7 @@ show_notification() {
     else
         echo '状态: 安装不完整或 PAM 条目被修改，请按 README 排查后重装。'
     fi
+    bruteforce_status
 }
 
 test_notification() {
@@ -306,6 +876,7 @@ uninstall_notification() (
     if [[ -e $INSTALL_DIR || -L $INSTALL_DIR ]] && ! owned_install; then
         error "无法确认 $INSTALL_DIR 由本脚本创建，未删除任何内容。"; return 1
     fi
+    remove_bruteforce || return 1
     if [[ $state == absent && ! -e $INSTALL_DIR ]]; then
         echo '尚未安装或已经卸载，无需重复操作。'; return 0
     fi
@@ -339,7 +910,7 @@ with_lock() (
 
 usage() {
     cat <<'USAGE_EOF'
-用法：bash ssh-tg-notify.sh [install|show|test|uninstall]
+用法：bash ssh-tg-notify.sh [install|show|test|enable-bruteforce|disable-bruteforce|test-bruteforce|rank|uninstall]
 不带参数时显示菜单。install 交互读取服务器名称、TG_BOT_TOKEN、TG_CHAT_ID。
 请以 root 身份在支持 PAM 的 Linux OpenSSH 服务器运行。
 USAGE_EOF
@@ -349,13 +920,13 @@ main() {
     local action=${1:-menu} choice dependency
     case $action in -h|--help|help) usage; return 0 ;; esac
     [[ $# -le 1 ]] || { usage >&2; return 1; }
-    case $action in menu|install|show|test|uninstall) ;; *) usage >&2; return 1 ;; esac
+    case $action in menu|install|show|test|enable-bruteforce|disable-bruteforce|test-bruteforce|rank|uninstall) ;; *) usage >&2; return 1 ;; esac
     [[ $EUID -eq 0 ]] || { error '请先执行 sudo -i，再运行脚本。'; return 1; }
     [[ $(uname -s) == Linux ]] || { error '本脚本仅适用于 Linux。'; return 1; }
     PATH=/usr/sbin:/usr/bin:/sbin:/bin
     export PATH
     [[ -x /bin/bash ]] || { error '需要 /bin/bash，请先安装 Bash。'; return 1; }
-    for dependency in awk grep flock mktemp cp mv chmod cat tail rm rmdir hostname date cksum env; do
+    for dependency in awk grep flock mktemp cp mv chmod cat tail rm rmdir mkdir hostname date cksum env; do
         command -v "$dependency" >/dev/null 2>&1 || {
             error "缺少依赖 $dependency，请参考 README 安装依赖。"; return 1;
         }
@@ -365,18 +936,26 @@ main() {
         install) with_lock install_notification; return $? ;;
         show) with_lock show_notification; return $? ;;
         test) with_lock test_notification; return $? ;;
+        enable-bruteforce) with_lock enable_bruteforce; return $? ;;
+        disable-bruteforce) with_lock disable_bruteforce; return $? ;;
+        test-bruteforce) with_lock test_bruteforce; return $? ;;
+        rank) with_lock show_failed_ranking; return $? ;;
         uninstall) with_lock uninstall_notification; return $? ;;
     esac
     while true; do
-        printf '\nSSH 登录 Telegram 通知\n1. 添加 SSH 登录通知\n2. 查看通知配置\n3. 卸载通知\n4. 发送测试通知\n0. 退出\n'
-        read_field choice '请选择 [0-4]: ' || { printf '\n'; return 0; }
+        printf '\nSSH 登录 Telegram 通知\n1. 添加 SSH 登录通知\n2. 查看通知配置\n3. 发送测试通知\n4. 开启爆破通知\n5. 关闭爆破通知\n6. 发送爆破测试通知\n7. 查看失败排名\n8. 卸载全部\n0. 退出\n'
+        read_field choice '请选择 [0-8]: ' || { printf '\n'; return 0; }
         case $choice in
             1) with_lock install_notification ;;
             2) with_lock show_notification ;;
-            3) with_lock uninstall_notification ;;
-            4) with_lock test_notification ;;
+            3) with_lock test_notification ;;
+            4) with_lock enable_bruteforce ;;
+            5) with_lock disable_bruteforce ;;
+            6) with_lock test_bruteforce ;;
+            7) with_lock show_failed_ranking ;;
+            8) with_lock uninstall_notification ;;
             0) return 0 ;;
-            *) echo '无效选项，请输入 0、1、2、3 或 4。' ;;
+            *) echo '无效选项，请输入 0 到 8。' ;;
         esac
     done
 }

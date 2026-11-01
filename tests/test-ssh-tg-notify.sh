@@ -35,11 +35,15 @@ new_case() {
     INSTALL_DIR=$CASE_DIR/install
     CONFIG_FILE=$INSTALL_DIR/config
     NOTIFIER=$INSTALL_DIR/notify.sh
+    GUARD=$INSTALL_DIR/guard.py
     PAM_FILE=$CASE_DIR/sshd
     LOCK_FILE=$CASE_DIR/lock
     PAM_ENTRY="session optional pam_exec.so quiet type=open_session $NOTIFIER"
     FAKE_CURL=$CASE_DIR/curl
     CURL_BIN=$FAKE_CURL
+    mkdir "$CASE_DIR/units"
+    UNIT_FILE=$CASE_DIR/units/$UNIT_NAME
+    STATE_DIR=$CASE_DIR/state
     printf '# existing PAM settings\nauth required pam_example.so\nsession required pam_other.so\n' > "$PAM_FILE"
     cp -- "$PAM_FILE" "$CASE_DIR/baseline"
     {
@@ -61,6 +65,31 @@ FAKE_EOF
     } > "$FAKE_CURL"
     chmod 700 "$FAKE_CURL"
     INPUT=$(printf '%s\n' 'Demo & _node' '123456:TEST_token-abc' '-1001234567890')
+}
+
+check_bruteforce_dependencies() { PYTHON_BIN=$(command -v python); }
+
+# The real systemctl is never invoked by tests.
+systemctl() {
+    printf '%s\n' "$*" >> "$CASE_DIR/systemctl-calls"
+    case $1 in
+        is-active) [[ -f $CASE_DIR/active ]] ;;
+        is-enabled) [[ -f $CASE_DIR/enabled ]] ;;
+        enable)
+            [[ ! -f $CASE_DIR/start-fails ]] || return 1
+            : > "$CASE_DIR/enabled"
+            [[ ${2:-} != --now ]] || : > "$CASE_DIR/active"
+            return 0
+            ;;
+        stop|disable)
+            [[ ! -f $CASE_DIR/stop-fails ]] || return 1
+            rm -f -- "$CASE_DIR/active"
+            [[ $1 != disable ]] || rm -f -- "$CASE_DIR/enabled"
+            return 0
+            ;;
+        daemon-reload) return 0 ;;
+        *) fail "Unexpected systemctl command: $*" ;;
+    esac
 }
 
 install_ok() {
@@ -296,6 +325,87 @@ test_curl_environment() {
     if grep -Eq '^(HTTPS_PROXY|CURL_CA_BUNDLE)=' "$CASE_DIR/request-env"; then fail 'Inherited unsafe curl environment'; fi
 }
 
+test_bruteforce_requires_login() {
+    new_case
+    if enable_bruteforce > "$CASE_DIR/output" 2>&1; then fail 'Enabled monitoring without login config'; fi
+    if test_bruteforce >> "$CASE_DIR/output" 2>&1; then fail 'Tested monitoring without login config'; fi
+    assert_absent "$UNIT_FILE"
+    assert_absent "$STATE_DIR"
+    assert_absent "$CASE_DIR/systemctl-calls"
+}
+
+enable_ok() {
+    enable_bruteforce > "$CASE_DIR/enable-output" 2>&1 || {
+        cat "$CASE_DIR/enable-output" >&2; fail 'Enable failed';
+    }
+    [[ -f $CASE_DIR/active && -f $CASE_DIR/enabled ]] || fail 'Service not enabled and active'
+    owned_unit || fail 'Service ownership marker missing'
+    assert_contains "$UNIT_FILE" "--state-dir \"$STATE_DIR\""
+    assert_contains "$GUARD" 'def watch('
+}
+
+test_bruteforce_lifecycle() {
+    new_case
+    install_ok
+    cp "$CONFIG_FILE" "$CASE_DIR/saved-config"
+    enable_ok
+    printf 'retained state' > "$STATE_DIR/state.sqlite3"
+    enable_ok
+    assert_contains "$STATE_DIR/state.sqlite3" 'retained state'
+    disable_bruteforce > "$CASE_DIR/output" 2>&1 || fail 'Disable failed'
+    assert_absent "$CASE_DIR/active"
+    assert_absent "$CASE_DIR/enabled"
+    [[ $(pam_state) == installed ]] || fail 'Disable removed login notification'
+    assert_same "$CONFIG_FILE" "$CASE_DIR/saved-config"
+    enable_ok
+    assert_absent "$STATE_DIR/state.sqlite3"
+    assert_same "$CONFIG_FILE" "$CASE_DIR/saved-config"
+}
+
+test_bruteforce_start_failure() {
+    new_case
+    install_ok
+    : > "$CASE_DIR/start-fails"
+    if enable_bruteforce > "$CASE_DIR/output" 2>&1; then fail 'Accepted failed service start'; fi
+    assert_absent "$CASE_DIR/active"
+    assert_absent "$CASE_DIR/enabled"
+    [[ $(pam_state) == installed ]] || fail 'Failed monitor start damaged login hook'
+    load_config || fail 'Failed monitor start damaged credentials'
+}
+
+test_uninstall_all() {
+    new_case
+    install_ok
+    enable_ok
+    uninstall_notification > "$CASE_DIR/output" 2>&1 || fail 'Uninstall all failed'
+    assert_absent "$INSTALL_DIR"
+    assert_absent "$STATE_DIR"
+    assert_absent "$UNIT_FILE"
+    assert_absent "$CASE_DIR/active"
+    assert_absent "$CASE_DIR/enabled"
+    assert_same "$PAM_FILE" "$CASE_DIR/baseline"
+    assert_contains "$CASE_DIR/systemctl-calls" "disable --now $UNIT_NAME"
+}
+
+test_monitor_stop_failure_preserves_files() {
+    new_case
+    install_ok
+    enable_ok
+    : > "$CASE_DIR/stop-fails"
+    if uninstall_notification > "$CASE_DIR/output" 2>&1; then fail 'Uninstalled a running monitor'; fi
+    [[ $(pam_state) == installed && -f $GUARD && -f $CONFIG_FILE && -f $UNIT_FILE ]] || fail 'Deleted files used by a running service'
+}
+
+test_unknown_monitor_files_preserved() {
+    new_case
+    install_ok
+    printf 'unrelated unit\n' > "$UNIT_FILE"
+    if enable_bruteforce > "$CASE_DIR/output" 2>&1; then fail 'Overwrote unknown service'; fi
+    if uninstall_notification >> "$CASE_DIR/output" 2>&1; then fail 'Deleted unknown service'; fi
+    assert_contains "$UNIT_FILE" 'unrelated unit'
+    [[ $(pam_state) == installed ]] || fail 'Unknown unit changed PAM state'
+}
+
 tests=(
     test_install_and_show test_repeat_install test_failed_api test_invalid_input
     test_input_eof test_config_is_data test_duplicate_config_keys
@@ -304,6 +414,8 @@ tests=(
     test_conflicting_pam test_unowned_directory test_legacy_detection
     test_commented_legacy_is_ignored test_notification_filters_and_background
     test_saved_config_test test_pam_without_final_newline test_curl_environment
+    test_bruteforce_requires_login test_bruteforce_lifecycle test_bruteforce_start_failure
+    test_uninstall_all test_monitor_stop_failure_preserves_files test_unknown_monitor_files_preserved
 )
 passed=0 failed=0
 for test_name in "${tests[@]}"; do
